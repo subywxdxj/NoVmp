@@ -351,8 +351,25 @@ namespace vmp
 		// Instruction stream should start with a 32 bit constant being pushed which is the 
 		// encrypted offset to the beginning of the virtual instruction stream
 		//
-		fassert( is[ 0 ].is( X86_INS_PUSH, { X86_OP_IMM } ) );
-		uint32_t vip_offset_encrypted = is[ 0 ].operands[ 0 ].imm;
+		uint32_t vip_offset_encrypted = 0;
+		//push imm
+		//or
+		//mov [rsp+?], imm
+
+		for (int i = 0; i < is.size(); i++)
+		{
+			if (is[i].id == X86_INS_PUSH && is[i].operands[0].type == X86_OP_IMM)//push imm
+			{
+				vip_offset_encrypted = is[i].operands[0].imm;
+				break;
+			}
+			else if (is[i].id == X86_INS_MOV && is[i].operands[1].type == X86_OP_IMM && is[i].operands[0].mem.base == X86_REG_RSP)//mov [rsp+?], imm
+			{
+				vip_offset_encrypted = is[i].operands[1].imm;
+				break;
+			}
+		}
+		fassert(vip_offset_encrypted != 0);
 
 		// Resolve the stack composition
 		//
@@ -363,23 +380,62 @@ namespace vmp
 		{ vstate->img->get_real_image_base() + is[ 0 ].address + is[ 0 ].bytes.size() + 5, 64 }
 		};
 
-		for ( int i = 0;; i++ )
-		{
-			// If PUSH R64
-			if ( is[ i ].is( X86_INS_PUSH, { X86_OP_REG } ) )
-				stack.push_back( is[ i ].operands[ 0 ].reg );
-			// If PUSHFQ
-			if ( is[ i ].is( X86_INS_PUSHFQ, {} ) )
-				stack.push_back( vtil::REG_FLAGS );
+		uint64_t image_base = vstate->img->get_mapped_image_base() - vstate->img->get_real_image_base();
+		int block_end = 0;
 
-			// End of pushed registers, reset stream
-			if ( is[ i ].is( X86_INS_MOVABS, { X86_OP_REG,  X86_OP_IMM } ) )
+		//find block end
+		for (int i = 0;; i++)
+		{
+			if (is[i].is(X86_INS_MOVABS, { X86_OP_REG,  X86_OP_IMM }))
 			{
-				reg_reloc_delta = is[ i ].operands[ 0 ].reg;
-				is.erase( i - 1 );
-				break;
+				if (is[i].operands[1].imm == 0 || is[i].operands[1].imm == image_base)//found end
+				{
+					block_end = i;
+					break;
+				}
 			}
 		}
+
+		for (int i = 0; i < block_end; i++)
+		{
+			// If PUSH R64
+			if (is[i].is(X86_INS_PUSH, { X86_OP_REG }))
+			{
+				bool pop = false;
+				for (int ii = i + 1; ii < block_end; ii++)
+				{
+					if ((is[ii].is(X86_INS_POP, { X86_OP_REG }) || is[ii].is(X86_INS_PUSH, { X86_OP_REG })) && is[ii].operands[0].reg == is[i].operands[0].reg)//cancel if pop/push same reg
+					{
+						pop = true;
+						break;
+					}
+				}
+				if (!pop)
+				{
+					stack.push_back(is[i].operands[0].reg);
+				}
+			}
+			// If PUSHFQ
+			if (is[i].is(X86_INS_PUSHFQ, {}))
+			{
+				bool pop = false;
+				for (int ii = i + 1;ii < block_end; ii++)
+				{
+					if (is[ii].is(X86_INS_POPFQ, {}) || is[ii].is(X86_INS_PUSHFQ, {}))//cancel if popfq or pushfq again
+					{
+						pop = true;
+						break;
+					}
+				}
+				if (!pop)
+				{
+					stack.push_back(vtil::REG_FLAGS);
+				}
+			}
+		}
+		reg_reloc_delta = is[block_end].operands[0].reg;
+		is.erase(block_end - 1);
+
 		fassert( stack.size() == ( 16 + 2 ) );
 
 		// Resolve the stack composition
@@ -414,14 +470,39 @@ namespace vmp
 
 		// Find the first stack access
 		//
-		int i_load_vip_id = is.next( X86_INS_MOV, { X86_OP_REG, X86_OP_MEM }, [ & ] ( const vtil::amd64::instruction& ins )
+		int i_load_vip_id = is.next(X86_INS_MOV, { X86_OP_REG, X86_OP_MEM }, [&](const vtil::amd64::instruction& ins)
+			{
+				return
+					ins.operands[1].mem.base == X86_REG_RSP &&
+					ins.operands[1].mem.disp == ep_vip_offset;
+			});
+		fassert(i_load_vip_id != -1);
+		//vstate->reg_vip = is[ i_load_vip_id ].operands[ 0 ].reg;
+
+		//they added use of lower bit registers
+		const int regs_size = 56;
+		x86_reg regs[regs_size] = { X86_REG_RAX, X86_REG_EAX, X86_REG_AX, X86_REG_AL,//auto set upper 64-bit reg
+							X86_REG_RBX, X86_REG_EBX, X86_REG_BX, X86_REG_BL,
+							X86_REG_RCX, X86_REG_ECX, X86_REG_CX, X86_REG_CL,
+							X86_REG_RDX, X86_REG_EDX, X86_REG_DX, X86_REG_DL,
+							X86_REG_RBP, X86_REG_EBP, X86_REG_BP, X86_REG_BPL,
+							X86_REG_RSP, X86_REG_ESP, X86_REG_SP, X86_REG_SPL,
+							X86_REG_RSI, X86_REG_ESI, X86_REG_SI, X86_REG_SIL,
+							X86_REG_RDI, X86_REG_EDI, X86_REG_DI, X86_REG_DIL,
+							X86_REG_R8, X86_REG_R8D, X86_REG_R8W, X86_REG_R8B,
+							X86_REG_R9, X86_REG_R9D, X86_REG_R9W, X86_REG_R9B,
+							X86_REG_R10, X86_REG_R10D, X86_REG_R10W, X86_REG_R10B,
+							X86_REG_R11, X86_REG_R11D, X86_REG_R11W, X86_REG_R11B,
+							X86_REG_R12, X86_REG_R12D, X86_REG_R12W, X86_REG_R12B,
+							X86_REG_R13, X86_REG_R13D, X86_REG_R13W, X86_REG_R13B };
+
+		for (int h = 0; h < regs_size; h++)
 		{
-			return
-				ins.operands[ 1 ].mem.base == X86_REG_RSP &&
-				ins.operands[ 1 ].mem.disp == ep_vip_offset;
-		} );
-		fassert( i_load_vip_id != -1 );
-		vstate->reg_vip = is[ i_load_vip_id ].operands[ 0 ].reg;
+			if (is[i_load_vip_id].operands[0].reg == regs[h])
+			{
+				vstate->reg_vip = regs[(h / 4) * 4];
+			}
+		}
 
 		// Find the first ADD r, x or LEA r, [r+x]
 		//
