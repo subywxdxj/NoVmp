@@ -289,8 +289,10 @@ namespace vmp
 			//
 			if ( instruction.is( X86_INS_CALL, { X86_OP_IMM } ) )
 				rva_rip = instruction.operands[ 0 ].imm;
-			else if ( instruction.is( X86_INS_JMP, { X86_OP_IMM } ) )
-				rva_rip = instruction.operands[ 0 ].imm, output.stream.pop_back();
+			else if ((((instruction.id >= 254 && instruction.id <= 272) || instruction.id == X86_INS_JMP) && instruction.operands[0].type == X86_OP_IMM))
+			{
+				rva_rip = instruction.operands[0].imm, output.stream.pop_back();//just take any conditional jump (not the case in newer versions)
+			}
 			else if ( instruction.id == X86_INS_JMP || instruction.id == X86_INS_RET )
 				break;
 			else
